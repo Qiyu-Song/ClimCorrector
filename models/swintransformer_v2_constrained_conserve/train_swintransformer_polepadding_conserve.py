@@ -60,7 +60,7 @@ def main(cfg: DictConfig) -> float:
         raise FileNotFoundError("No 'train_input.h5' files found under the specified parent path.")
     # check if val_dataset_path/val_input.h5 exists
     # note that here I assumed there is one or a few subfolders under val_dataset_path that contains val_input.h5
-    val_input_path =glob.glob(f'{val_dataset_path}/**/val_input.h5')
+    val_input_path =glob.glob(f'{val_dataset_path}/val_input.h5')
     if not val_input_path:
         raise FileNotFoundError("No 'val_input.h5' file found under the specified parent path.")
 
@@ -248,7 +248,7 @@ def main(cfg: DictConfig) -> float:
         initialize_wandb(
             project=cfg.wandb.project,
             name=cfg.expname,
-            entity="zeyuan_hu",
+            entity="qiyusong-harvard-university",
             mode="online",
         )
         LaunchLogger.initialize(use_wandb=True)
