@@ -1,0 +1,9 @@
+climcorrector_utils.egg-info/
+models/*/__pycache__/
+models/*/outputs/
+models/*/wandb/
+models/*/__pycache__/
+models/*/outputs/
+models/*/wandb/
+utils/__pycache__/
+
