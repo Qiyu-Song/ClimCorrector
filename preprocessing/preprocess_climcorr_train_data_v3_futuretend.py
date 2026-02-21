@@ -9,14 +9,14 @@ def preprocess_climcorr_train_data(year):
     Preprocesses ClimCorr data for a given year.
     :param year: The year as a string (e.g., '1980').
     """
-    parent_path = f'/n/holylfs04/LABS/kuang_lab/Lab/kuanglfs/zeyuanhu/climcorr_preprocessing/v3_futuretend/{year}/'
-    input_mean = np.load('/n/home00/zeyuanhu/ClimCorrector/preprocessing/normalization/inputs/input_mean_v3_futuretend_40year_sub23.npy')
-    input_std = np.load('/n/home00/zeyuanhu/ClimCorrector/preprocessing/normalization/inputs/input_std_v3_futuretend_40year_sub23.npy')
+    parent_path = f'/n/home03/qiyusong/scratch/climcorr_preprocessing/v3_futuretend/{year}/'
+    input_mean = np.load('/n/home03/qiyusong/ClimCorrector/preprocessing/normalization/inputs/input_mean_v3_futuretend_35year_sub23.npy')
+    input_std = np.load('/n/home03/qiyusong/ClimCorrector/preprocessing/normalization/inputs/input_std_v3_futuretend_35year_sub23.npy')
     # for the target variables, we use the same mean and std as previous version
-    target_mean_dc = np.load('/n/home00/zeyuanhu/ClimCorrector/preprocessing/normalization/outputs/target_dc_mean_v2_iter2_40year_sub23.npy')
-    target_std_dc = np.load('/n/home00/zeyuanhu/ClimCorrector/preprocessing/normalization/outputs/target_dc_std_v2_iter2_40year_sub23.npy')
-    target_mean_sum = np.load('/n/home00/zeyuanhu/ClimCorrector/preprocessing/normalization/outputs/target_sum_mean_v2_iter2_40year_sub23.npy')
-    target_std_sum = np.load('/n/home00/zeyuanhu/ClimCorrector/preprocessing/normalization/outputs/target_sum_std_v2_iter2_40year_sub23.npy')
+    target_mean_dc = np.load('/n/home03/qiyusong/ClimCorrector/preprocessing/normalization/outputs/target_dc_mean_v2_iter2_35year_sub23.npy')
+    target_std_dc = np.load('/n/home03/qiyusong/ClimCorrector/preprocessing/normalization/outputs/target_dc_std_v2_iter2_35year_sub23.npy')
+    target_mean_sum = np.load('/n/home03/qiyusong/ClimCorrector/preprocessing/normalization/outputs/target_sum_mean_v2_iter2_35year_sub23.npy')
+    target_std_sum = np.load('/n/home03/qiyusong/ClimCorrector/preprocessing/normalization/outputs/target_sum_std_v2_iter2_35year_sub23.npy')
 
     input_path = f'{parent_path}/train_input.h5'
     target_path_dc = f'{parent_path}/train_target_dc.h5'
@@ -61,10 +61,8 @@ def preprocess_climcorr_train_data(year):
 
     assert xshape[0] == yshape[0]
 
-    target_path = f'/n/holylfs04/LABS/kuang_lab/Lab/kuanglfs/zeyuanhu/climcorr_preprocessing/v3_futuretend_processed/{year}/'
-
-    if not os.path.exists(target_path):
-        os.makedirs(target_path)
+    target_path = f'/n/home03/qiyusong/scratch/climcorr_preprocessing/v3_futuretend_processed/{year}/'
+    os.makedirs(target_path, exist_ok=True)
 
     h5_path = target_path + 'train_input.h5'
     with h5py.File(h5_path, 'w') as hdf:

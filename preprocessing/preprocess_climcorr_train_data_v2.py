@@ -2,19 +2,20 @@
 import numpy as np
 import h5py
 import gc
+import os
 
 def preprocess_climcorr_train_data(year):
     """
     Preprocesses ClimCorr data for a given year.
     :param year: The year as a string (e.g., '1980').
     """
-    parent_path = f'/n/home00/zeyuanhu/scratch/climcorr_preprocessing/v2_iter2/{year}/'
-    input_mean = np.load('/n/home00/zeyuanhu/ClimCorrector/preprocessing/normalization/inputs/input_mean_v2_iter2_40year_sub23.npy')
-    input_std = np.load('/n/home00/zeyuanhu/ClimCorrector/preprocessing/normalization/inputs/input_std_v2_iter2_40year_sub23.npy')
-    target_mean_dc = np.load('/n/home00/zeyuanhu/ClimCorrector/preprocessing/normalization/outputs/target_dc_mean_v2_iter2_40year_sub23.npy')
-    target_std_dc = np.load('/n/home00/zeyuanhu/ClimCorrector/preprocessing/normalization/outputs/target_dc_std_v2_iter2_40year_sub23.npy')
-    target_mean_sum = np.load('/n/home00/zeyuanhu/ClimCorrector/preprocessing/normalization/outputs/target_sum_mean_v2_iter2_40year_sub23.npy')
-    target_std_sum = np.load('/n/home00/zeyuanhu/ClimCorrector/preprocessing/normalization/outputs/target_sum_std_v2_iter2_40year_sub23.npy')
+    parent_path = f'/n/home03/qiyusong/scratch/climcorr_preprocessing/v2_iter2/{year}/'
+    input_mean = np.load('/n/home03/qiyusong/ClimCorrector/preprocessing/normalization/inputs/input_mean_v2_iter2_35year_sub23.npy')
+    input_std = np.load('/n/home03/qiyusong/ClimCorrector/preprocessing/normalization/inputs/input_std_v2_iter2_35year_sub23.npy')
+    target_mean_dc = np.load('/n/home03/qiyusong/ClimCorrector/preprocessing/normalization/outputs/target_dc_mean_v2_iter2_35year_sub23.npy')
+    target_std_dc = np.load('/n/home03/qiyusong/ClimCorrector/preprocessing/normalization/outputs/target_dc_std_v2_iter2_35year_sub23.npy')
+    target_mean_sum = np.load('/n/home03/qiyusong/ClimCorrector/preprocessing/normalization/outputs/target_sum_mean_v2_iter2_35year_sub23.npy')
+    target_std_sum = np.load('/n/home03/qiyusong/ClimCorrector/preprocessing/normalization/outputs/target_sum_std_v2_iter2_35year_sub23.npy')
 
     # make std for cloud variables to be max(std, 1e-5)
     input_std[26*4:26*6] = np.maximum(input_std[26*4:26*6], 1e-5)
@@ -58,7 +59,8 @@ def preprocess_climcorr_train_data(year):
 
     assert xshape[0] == yshape[0]
 
-    target_path = f'/n/home00/zeyuanhu/scratch/climcorr_preprocessing/v2_iter2_processed/{year}/'
+    target_path = f'/n/home03/qiyusong/scratch/climcorr_preprocessing/v2_iter2_processed/{year}/'
+    os.makedirs(target_path, exist_ok=True)
     h5_path = target_path + 'train_input.h5'
     with h5py.File(h5_path, 'w') as hdf:
         hdf.create_dataset('data', data=x, dtype=np.float32)

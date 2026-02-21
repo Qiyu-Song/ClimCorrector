@@ -1,0 +1,8 @@
+/n/home03/qiyusong/ClimCorrector/preprocessing/preprocess_climcorr_train_data_v3_futuretend.py:50: RuntimeWarning: invalid value encountered in sqrt
+  y_dc = np.where(y_dc > cutoff, y_dc**0.5 - cutoff**0.5 + cutoff, y_dc)
+/n/home03/qiyusong/ClimCorrector/preprocessing/preprocess_climcorr_train_data_v3_futuretend.py:51: RuntimeWarning: invalid value encountered in sqrt
+  y_dc = np.where(y_dc < -cutoff, -(-y_dc)**0.5 + cutoff**0.5 - cutoff, y_dc)
+/n/home03/qiyusong/ClimCorrector/preprocessing/preprocess_climcorr_train_data_v3_futuretend.py:52: RuntimeWarning: invalid value encountered in sqrt
+  y_sum = np.where(y_sum > cutoff, y_sum**0.5 - cutoff**0.5 + cutoff, y_sum)
+/n/home03/qiyusong/ClimCorrector/preprocessing/preprocess_climcorr_train_data_v3_futuretend.py:53: RuntimeWarning: invalid value encountered in sqrt
+  y_sum = np.where(y_sum < -cutoff, -(-y_sum)**0.5 + cutoff**0.5 - cutoff, y_sum)

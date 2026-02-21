@@ -1,0 +1,2 @@
+/var/slurmd/spool/slurmd/job58789799/slurm_script: line 18: 1643305 Killed                  python preprocessing/preprocess_climcorr_val_data_v3_futuretend.py
+[2026-02-04T21:47:26.091] error: Detected 1 oom_kill event in StepId=58789799.batch. Some of the step tasks have been OOM Killed.

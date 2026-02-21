@@ -3,16 +3,16 @@
 #SBATCH -n 1
 #SBATCH -o out-1997-%j
 #SBATCH -e eo-1997-%j
-#SBATCH -p huce_ice
+#SBATCH -p huce_ice,huce_cascade
 #SBATCH --contiguous
 #SBATCH --mail-type=END
-#SBATCH --mail-user=zeyuan_hu@fas.harvard.edu
+#SBATCH --mail-user=qsong@g.harvard.edu
 #SBATCH -J create_data_1997 # job name
 #SBATCH -t 60
 #SBATCH --mem-per-cpu=128000
 #SBATCH --no-requeue
 
-cd /n/home00/zeyuanhu/ClimCorrector
-source activate /n/holylfs04/LABS/kuang_lab/Lab/kuanglfs/zeyuanhu/mamba_env/climcorr
+cd /n/home03/qiyusong/ClimCorrector
+source activate /n/holylfs06/LABS/kuang_lab/Lab/qiyusong/mamba_envs/climcorr
 
 python preprocessing/preprocess_climcorr_train_data_v3_futuretend.py 1997
