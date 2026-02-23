@@ -16,11 +16,14 @@ from modulus.launch.logging import (
 from utils.data_utils import *
 from climsim_datapip_processed_h5 import climsim_dataset_processed_h5
 
-from swintransformer_modulus_polepadding_conserve import SwinTransformerV2CrModulus_polepadding_conserve
-import swintransformer_modulus_polepadding_conserve as swintransformer_modulus_polepadding_conserve
+from swintransformer_modulus_polepadding_conserve_rope import SwinTransformerV2CrModulus_polepadding_conserve
+import swintransformer_modulus_polepadding_conserve_rope as swintransformer_modulus_polepadding_conserve_rope
 
-from swintransformer_modulus_polepadding import SwinTransformerV2CrModulus_polepadding
-import swintransformer_modulus_polepadding as swintransformer_modulus_polepadding
+#from swintransformer_modulus_polepadding_conserve import SwinTransformerV2CrModulus_polepadding_conserve
+#import swintransformer_modulus_polepadding_conserve as swintransformer_modulus_polepadding_conserve
+
+#from swintransformer_modulus_polepadding import SwinTransformerV2CrModulus_polepadding
+#import swintransformer_modulus_polepadding as swintransformer_modulus_polepadding
 
 import hydra
 from torch.nn.parallel import DistributedDataParallel
@@ -108,6 +111,8 @@ def main(cfg: DictConfig) -> float:
         drop_rate = cfg.swin.drop_rate,
         full_pos_embed = False,
         rel_pos= True,
+        pos_encoding="rope_mixed",
+        rope_theta=10.0,
         checkpoint_stages = cfg.swin.checkpoint_stages,
         residual = False,
         random_shift = False,

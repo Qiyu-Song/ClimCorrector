@@ -221,7 +221,7 @@ class WindowMultiHeadAttentionNoPos(nn.Module):
         return x
 
 
-class WindowMultiHeadAttention(nn.Module):
+class WindowMultiHeadAttentionRPB(nn.Module):
     r"""This class implements window-based Multi-Head-Attention with log-spaced continuous position bias.
 
     Args:
@@ -244,7 +244,7 @@ class WindowMultiHeadAttention(nn.Module):
         meta_hidden_dim: int = 384,  # FIXME what's the optimal value?
         sequential_attn: bool = False,
     ) -> None:
-        super(WindowMultiHeadAttention, self).__init__()
+        super(WindowMultiHeadAttentionRPB, self).__init__()
         assert (
             dim % num_heads == 0
         ), "The number of input features (in_features) are not divisible by the number of heads (num_heads)."
@@ -364,6 +364,242 @@ class WindowMultiHeadAttention(nn.Module):
         return x
 
 
+def _rope_rotate_half(x: torch.Tensor) -> torch.Tensor:
+    # (.., d) -> (.., d) with (x0,x1,x2,x3,...) -> (-x1,x0,-x3,x2,...)
+    x_even = x[..., 0::2]
+    x_odd = x[..., 1::2]
+    x_rot = torch.stack((-x_odd, x_even), dim=-1)
+    return x_rot.flatten(-2)
+
+
+def _rope_apply(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    # x, cos, sin broadcastable to (..., d)
+    return (x * cos) + (_rope_rotate_half(x) * sin)
+
+
+def _rope_init_random_2d_freqs(
+    head_dim: int, num_heads: int, theta: float = 100.0, rotate: bool = True
+) -> torch.Tensor:
+    """Init 2D RoPE frequencies with random per-head axis rotation.
+
+    Returns a tensor of shape (2, num_heads, complex_dim=head_dim//2):
+      freqs[0] -> x-axis frequencies per head
+      freqs[1] -> y-axis frequencies per head
+
+    This matches a common Swin+RoPE "mixed" init:
+    - build a base magnitude schedule with step 4 over head_dim
+    - allocate half the complex dims to one axis and half to an orthogonal axis
+    - optionally rotate axes by a random angle per head
+    """
+    if head_dim % 4 != 0:
+        raise ValueError(
+            f"RoPE mixed random-rotation init needs head_dim % 4 == 0, got head_dim={head_dim}"
+        )
+    mag = 1.0 / (
+        float(theta)
+        ** (
+            torch.arange(0, head_dim, 4, dtype=torch.float32)[: (head_dim // 4)]
+            / float(head_dim)
+        )
+    )  # (head_dim//4,)
+
+    freqs_x = []
+    freqs_y = []
+    for _ in range(num_heads):
+        angle = (
+            torch.rand(1, dtype=torch.float32) * 2.0 * math.pi
+            if rotate
+            else torch.zeros(1, dtype=torch.float32)
+        )
+        fx = torch.cat(
+            [mag * torch.cos(angle), mag * torch.cos(angle + math.pi / 2.0)], dim=-1
+        )
+        fy = torch.cat(
+            [mag * torch.sin(angle), mag * torch.sin(angle + math.pi / 2.0)], dim=-1
+        )
+        freqs_x.append(fx)
+        freqs_y.append(fy)
+
+    freqs_x = torch.stack(freqs_x, dim=0)  # (H, complex_dim)
+    freqs_y = torch.stack(freqs_y, dim=0)  # (H, complex_dim)
+    return torch.stack([freqs_x, freqs_y], dim=0)  # (2, H, complex_dim)
+
+
+class WindowMultiHeadAttentionRoPE(nn.Module):
+    r"""Window-based Multi-Head Attention with 2D RoPE (Axial or Mixed).
+
+    This replaces the additive relative position bias in Swin-V2 with RoPE,
+    applying rotary embeddings to *query* and *key* before scaled cosine attention.
+
+    Args:
+        dim: embedding dimension
+        num_heads: number of heads
+        window_size: (Wh, Ww)
+        rope_mode: 'mixed' or 'axial'
+        rope_theta: base for inverse frequencies (vision papers often use ~100)
+        drop_attn, drop_proj: dropout rates
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        window_size: Tuple[int, int],
+        rope_mode: str = "mixed",
+        rope_theta: float = 100.0,
+        drop_attn: float = 0.0,
+        drop_proj: float = 0.0,
+        sequential_attn: bool = False,
+    ) -> None:
+        super().__init__()
+        assert dim % num_heads == 0, (
+            "The number of input features (in_features) are not divisible by num_heads."
+        )
+        self.in_features: int = dim
+        self.window_size: Tuple[int, int] = window_size
+        self.num_heads: int = num_heads
+        self.sequential_attn: bool = sequential_attn
+
+        self.rope_mode = rope_mode
+        self.rope_theta = float(rope_theta)
+
+        self.qkv = nn.Linear(in_features=dim, out_features=dim * 3, bias=True)
+        self.attn_drop = nn.Dropout(drop_attn)
+        self.proj = nn.Linear(in_features=dim, out_features=dim, bias=True)
+        self.proj_drop = nn.Dropout(drop_proj)
+        # Swin-V2 scaled cosine attention
+        self.logit_scale = nn.Parameter(torch.log(10 * torch.ones(num_heads)))
+
+        head_dim = dim // num_heads
+        if head_dim % 2 != 0:
+            raise ValueError(f"RoPE needs even head_dim, got head_dim={head_dim}")
+        if self.rope_mode == "axial" and (head_dim % 4 != 0):
+            raise ValueError(
+                f"Axial 2D RoPE needs head_dim divisible by 4, got head_dim={head_dim}"
+            )
+
+        # Fixed inverse frequencies (used for axial); keep as a fallback init
+        complex_dim = head_dim // 2  # number of complex pairs
+        freq_seq = torch.arange(complex_dim, dtype=torch.float32)
+        inv_freq = self.rope_theta ** (-freq_seq / float(complex_dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        if self.rope_mode == "mixed":
+            # Learnable mixed-axis frequencies per head.
+            # Recommended init: random-rotated orthogonal axes per head (common Swin+RoPE practice),
+            # computed in fp32 for stability.
+            if head_dim % 4 == 0:
+                freqs = _rope_init_random_2d_freqs(
+                    head_dim=head_dim, num_heads=num_heads, theta=self.rope_theta, rotate=True
+                )  # (2, H, complex_dim)
+                self.theta_x = nn.Parameter(freqs[0].clone(), requires_grad=True)
+                self.theta_y = nn.Parameter(freqs[1].clone(), requires_grad=True)
+            else:
+                # Fallback: deterministic init if head_dim is not compatible with the orthogonal packing
+                theta0 = inv_freq[None, :].repeat(num_heads, 1)  # (H, complex_dim)
+                self.theta_x = nn.Parameter(theta0.clone(), requires_grad=True)
+                self.theta_y = nn.Parameter(theta0.clone(), requires_grad=True)
+        else:
+            self.theta_x = None
+            self.theta_y = None
+
+        self._make_window_positions()
+
+    def _make_window_positions(self) -> None:
+        device = self.logit_scale.device
+        Wh, Ww = self.window_size
+        yy, xx = torch.meshgrid(
+            torch.arange(Wh, device=device),
+            torch.arange(Ww, device=device),
+            indexing="ij",
+        )
+        self.register_buffer("pos_x", xx.reshape(-1).float(), persistent=False)  # (L,)
+        self.register_buffer("pos_y", yy.reshape(-1).float(), persistent=False)  # (L,)
+
+    def update_input_size(self, new_window_size: Tuple[int, int], **kwargs: Any) -> None:
+        self.window_size = new_window_size
+        self._make_window_positions()
+
+
+    def _rope_sincos(
+        self, dtype: torch.dtype, device: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute RoPE sin/cos in fp32 for stability, then cast to `dtype`.
+
+        Returns cos, sin broadcastable to (Bw, H, L, head_dim).
+        """
+        head_dim = self.in_features // self.num_heads
+        compute_dtype = torch.float32
+        out_dtype = dtype
+
+        if self.rope_mode == "axial":
+            # Split channels: first half for x, second half for y (each half uses 1D RoPE)
+            half = head_dim // 2
+            inv = self.inv_freq[: half // 2].to(device=device, dtype=compute_dtype)  # (half/2,)
+
+            pos_x = self.pos_x.to(device=device, dtype=compute_dtype)  # (L,)
+            pos_y = self.pos_y.to(device=device, dtype=compute_dtype)  # (L,)
+
+            ang_x = pos_x[:, None] * inv[None, :]  # (L, half/2)
+            ang_y = pos_y[:, None] * inv[None, :]  # (L, half/2)
+
+            cos_x = torch.cos(ang_x).repeat_interleave(2, dim=-1)  # (L, half)
+            sin_x = torch.sin(ang_x).repeat_interleave(2, dim=-1)
+            cos_y = torch.cos(ang_y).repeat_interleave(2, dim=-1)  # (L, half)
+            sin_y = torch.sin(ang_y).repeat_interleave(2, dim=-1)
+
+            cos = torch.cat([cos_x, cos_y], dim=-1).unsqueeze(0).unsqueeze(0)  # (1,1,L,head_dim)
+            sin = torch.cat([sin_x, sin_y], dim=-1).unsqueeze(0).unsqueeze(0)
+            return cos.to(dtype=out_dtype), sin.to(dtype=out_dtype)
+
+        # mixed: per-head angles, learnable (theta_x, theta_y)
+        pos_x = self.pos_x.to(device=device, dtype=compute_dtype)[None, :, None]  # (1,L,1)
+        pos_y = self.pos_y.to(device=device, dtype=compute_dtype)[None, :, None]
+        theta_x = self.theta_x.to(device=device, dtype=compute_dtype)[:, None, :]  # (H,1,complex_dim)
+        theta_y = self.theta_y.to(device=device, dtype=compute_dtype)[:, None, :]
+        ang = pos_x * theta_x + pos_y * theta_y  # (H,L,complex_dim)
+
+        cos = torch.cos(ang).repeat_interleave(2, dim=-1).unsqueeze(0)  # (1,H,L,head_dim)
+        sin = torch.sin(ang).repeat_interleave(2, dim=-1).unsqueeze(0)
+        return cos.to(dtype=out_dtype), sin.to(dtype=out_dtype)
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        Bw, L, C = x.shape
+
+        qkv = (
+            self.qkv(x)
+            .view(Bw, L, 3, self.num_heads, C // self.num_heads)
+            .permute(2, 0, 3, 1, 4)
+        )
+        query, key, value = qkv.unbind(0)  # (Bw, H, L, head_dim)
+
+        # RoPE on Q,K (rotation preserves norms; normalize after is fine)
+        cos, sin = self._rope_sincos(dtype=query.dtype, device=query.device)
+        query = _rope_apply(query, cos, sin)
+        key = _rope_apply(key, cos, sin)
+
+        # scaled cosine attention (Swin-V2)
+        attn = F.normalize(query, dim=-1) @ F.normalize(key, dim=-1).transpose(-2, -1)
+        logit_scale = torch.clamp(
+            self.logit_scale.reshape(1, self.num_heads, 1, 1), max=math.log(1.0 / 0.01)
+        ).exp()
+        attn = attn * logit_scale
+
+        if mask is not None:
+            num_win: int = mask.shape[0]
+            attn = attn.view(Bw // num_win, num_win, self.num_heads, L, L)
+            attn = attn + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, L, L)
+
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        out = (attn @ value).transpose(1, 2).reshape(Bw, L, -1)
+        out = self.proj(out)
+        out = self.proj_drop(out)
+        return out
+
+
 class SwinTransformerV2CrBlock(nn.Module):
     r"""This class implements the Swin transformer block.
 
@@ -396,6 +632,8 @@ class SwinTransformerV2CrBlock(nn.Module):
         extra_norm: bool = False,
         sequential_attn: bool = False,
         rel_pos: bool = True,
+        pos_encoding: str = "rope_mixed",
+        rope_theta: float = 100.0,
     ) -> None:
         super(SwinTransformerV2CrBlock, self).__init__()
         self.dim: int = dim
@@ -406,19 +644,37 @@ class SwinTransformerV2CrBlock(nn.Module):
         )
         self.window_area = self.window_size[0] * self.window_size[1]
         self.init_values: Optional[float] = init_values
-        window_attn_block = (
-            WindowMultiHeadAttention if rel_pos else WindowMultiHeadAttentionNoPos
-        )
-
         # attn branch
-        self.attn = window_attn_block(
-            dim=dim,
-            num_heads=num_heads,
-            window_size=self.window_size,
-            drop_attn=drop_attn,
-            drop_proj=proj_drop,
-            sequential_attn=sequential_attn,
-        )
+        if (not rel_pos) or (pos_encoding == "none"):
+            self.attn = WindowMultiHeadAttentionNoPos(
+                dim=dim,
+                num_heads=num_heads,
+                window_size=self.window_size,
+                drop_attn=drop_attn,
+                drop_proj=proj_drop,
+                sequential_attn=sequential_attn,
+            )
+        elif pos_encoding == "rpb":
+            self.attn = WindowMultiHeadAttentionRPB(
+                dim=dim,
+                num_heads=num_heads,
+                window_size=self.window_size,
+                drop_attn=drop_attn,
+                drop_proj=proj_drop,
+                sequential_attn=sequential_attn,
+            )
+        else:
+            rope_mode = "mixed" if ("mixed" in pos_encoding) else "axial"
+            self.attn = WindowMultiHeadAttentionRoPE(
+                dim=dim,
+                num_heads=num_heads,
+                window_size=self.window_size,
+                rope_mode=rope_mode,
+                rope_theta=rope_theta,
+                drop_attn=drop_attn,
+                drop_proj=proj_drop,
+                sequential_attn=sequential_attn,
+            )
         self.norm1 = nn.LayerNorm(dim)
         self.drop_path1 = (
             DropPath(drop_prob=drop_path) if drop_path > 0.0 else nn.Identity()
@@ -663,6 +919,8 @@ class SwinTransformerV2CrStage(nn.Module):
         extra_norm_stage: bool = False,
         sequential_attn: bool = False,
         rel_pos: bool = True,
+        pos_encoding: str = "rope_mixed",
+        rope_theta: float = 100.0,
         grad_checkpointing: bool = False,
         random_shift: bool = False,
     ) -> None:
@@ -711,6 +969,8 @@ class SwinTransformerV2CrStage(nn.Module):
                     extra_norm=_extra_norm(index),
                     sequential_attn=sequential_attn,
                     rel_pos=rel_pos,
+                    pos_encoding=pos_encoding,
+                    rope_theta=rope_theta,
                 )
                 for index in range(depth)
             ]
@@ -802,6 +1062,8 @@ class SwinTransformerV2CrModulus_polepadding_conserve(modulus.Module):
         global_pool: str = "avg",
         full_pos_embed: bool = False,
         rel_pos: bool = True,
+        pos_encoding: str = "rope_mixed",
+        rope_theta: float = 10.0,
         checkpoint_stages: bool = False,
         residual: bool = False,
         random_shift: bool = False,
@@ -917,6 +1179,8 @@ class SwinTransformerV2CrModulus_polepadding_conserve(modulus.Module):
                     or (stage_idx + 1) == len(depths),  # last stage ends w/ norm
                     sequential_attn=sequential_attn,
                     rel_pos=rel_pos,
+                    pos_encoding=pos_encoding,
+                    rope_theta=rope_theta,
                     grad_checkpointing=self.checkpoint_stages,
                     random_shift=random_shift,
                 )
