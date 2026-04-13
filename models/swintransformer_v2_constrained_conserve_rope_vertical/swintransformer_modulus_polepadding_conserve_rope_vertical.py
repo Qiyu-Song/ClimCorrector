@@ -882,6 +882,126 @@ class PatchEmbed(nn.Module):
         x = self.norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         return x
 
+class VerticalPatchEmbed(nn.Module):
+    """
+    Vertical-aware patch embedding
+
+    Assumes channel layout (v2):
+      first 182 channels = 7 multilevel vars x 26 levels
+      remaining channels = single-level / broadcast vars
+    """
+    def __init__(
+        self,
+        img_size=224,
+        patch_size=1,
+        in_chans=200,
+        embed_dim=768,
+        nlev=26,
+        n3d_vars=7,
+        vert_dim=8,
+        surf_dim=16,
+        use_level_emb=True,
+    ):
+        super().__init__()
+        img_size = to_2tuple(img_size)
+        patch_size = to_2tuple(patch_size)
+
+        if patch_size != (1, 1):
+            raise ValueError(
+                f"VerticalPatchEmbed currently expects patch_size=1, got {patch_size}"
+            )
+
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.grid_size = (img_size[0], img_size[1])
+        self.num_patches = self.grid_size[0] * self.grid_size[1]
+
+        self.nlev = nlev
+        self.n3d_vars = n3d_vars
+        self.n3d_ch = n3d_vars * nlev
+        self.n2d_ch = in_chans - self.n3d_ch
+        self.vert_dim = vert_dim
+        self.surf_dim = surf_dim
+
+        if self.n2d_ch < 0:
+            raise ValueError(
+                f"in_chans={in_chans} is too small for n3d_vars={n3d_vars}, nlev={nlev}"
+            )
+
+        # Learned level embedding, separate for each 3D variable
+        if use_level_emb:
+            self.level_emb = nn.Parameter(torch.zeros(1, n3d_vars, nlev))
+        else:
+            self.level_emb = None
+
+        # Cheap vertical mixer:
+        # input shape will be [B*H*W, n3d_vars, nlev]
+        self.vert_in = nn.Conv1d(n3d_vars, vert_dim, kernel_size=3, padding=1)
+        self.vert_mid = nn.Conv1d(vert_dim, vert_dim, kernel_size=3, padding=1)
+        self.vert_out = nn.Conv1d(vert_dim, vert_dim, kernel_size=1)
+
+        # Surface / single-level branch
+        if self.n2d_ch > 0:
+            self.sfc_proj = nn.Conv2d(self.n2d_ch, surf_dim, kernel_size=1)
+        else:
+            self.sfc_proj = None
+            self.surf_dim = 0
+
+        # Fuse back to backbone width
+        self.proj = nn.Conv2d(
+            vert_dim * nlev + self.surf_dim,
+            embed_dim,
+            kernel_size=1,
+            stride=1,
+        )
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        _assert(
+            H == self.img_size[0],
+            f"Input image height ({H}) doesn't match model ({self.img_size[0]}).",
+        )
+        _assert(
+            W == self.img_size[1],
+            f"Input image width ({W}) doesn't match model ({self.img_size[1]}).",
+        )
+
+        # Split 3D and 2D channels
+        x3d = x[:, :self.n3d_ch, :, :]   # [B, 182, H, W]
+        x2d = x[:, self.n3d_ch:, :, :]   # [B, 18, H, W] for v2
+
+        # Reshape to [B*H*W, n3d_vars, nlev]
+        x3d = x3d.view(B, self.n3d_vars, self.nlev, H, W)
+        x3d = x3d.permute(0, 3, 4, 1, 2).contiguous()
+        x3d = x3d.view(B * H * W, self.n3d_vars, self.nlev)
+
+        # Add learned level embedding
+        if self.level_emb is not None:
+            x3d = x3d + self.level_emb
+
+        # Vertical mixing
+        x3d = F.gelu(self.vert_in(x3d))
+        x3d = F.gelu(self.vert_mid(x3d))
+        x3d = F.gelu(self.vert_out(x3d))
+
+        # Back to [B, vert_dim*nlev, H, W]
+        x3d = x3d.view(B, H, W, self.vert_dim, self.nlev)
+        x3d = x3d.permute(0, 3, 4, 1, 2).contiguous()
+        x3d = x3d.view(B, self.vert_dim * self.nlev, H, W)
+
+        # Single-level branch
+        if self.sfc_proj is not None:
+            x2d = F.gelu(self.sfc_proj(x2d))
+            x = torch.cat([x3d, x2d], dim=1)
+        else:
+            x = x3d
+
+        # Final projection to embed_dim
+        x = self.proj(x)
+        x = self.norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        return x
+
 
 class SwinTransformerV2CrStage(nn.Module):
     r"""This class implements a stage of the Swin transformer including multiple layers.
@@ -1080,6 +1200,11 @@ class SwinTransformerV2CrModulus_polepadding_conserve(modulus.Module):
         pressure_index: int = 130,
         sdiff_std_file = None,
         qdiff_std_file = None,
+        vertical_embed: bool = True,
+        nlev: int = 26,
+        n3d_vars: int = 7,
+        vert_dim: int = 8,
+        surf_dim: int = 16,
         **kwargs: Any,
     ) -> None:
         # super(SwinTransformerV2Cr, self).__init__()
@@ -1142,12 +1267,25 @@ class SwinTransformerV2CrModulus_polepadding_conserve(modulus.Module):
         self.register_buffer("qdiff_std", _load_maybe(qdiff_std_file)) # of shape (26,96)
 
 
-        self.patch_embed = PatchEmbed(
-            img_size=img_size,
-            patch_size=patch_size,
-            in_chans=in_chans,
-            embed_dim=embed_dim,
-        )
+        if vertical_embed:
+            self.patch_embed = VerticalPatchEmbed(
+                img_size=img_size,
+                patch_size=patch_size,
+                in_chans=in_chans,
+                embed_dim=embed_dim,
+                nlev=nlev,
+                n3d_vars=n3d_vars,
+                vert_dim=vert_dim,
+                surf_dim=surf_dim,
+                use_level_emb=True,
+            )
+        else:
+            self.patch_embed = PatchEmbed(
+                img_size=img_size,
+                patch_size=patch_size,
+                in_chans=in_chans,
+                embed_dim=embed_dim,
+            )
         patch_grid_size: Tuple[int, int] = self.patch_embed.grid_size
 
         dpr = [

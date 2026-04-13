@@ -16,8 +16,8 @@ from modulus.launch.logging import (
 from utils.data_utils import *
 from climsim_datapip_processed_h5 import climsim_dataset_processed_h5
 
-from swintransformer_modulus_polepadding_conserve_rope import SwinTransformerV2CrModulus_polepadding_conserve
-import swintransformer_modulus_polepadding_conserve_rope as swintransformer_modulus_polepadding_conserve_rope
+from swintransformer_modulus_polepadding_conserve_rope_vertical import SwinTransformerV2CrModulus_polepadding_conserve
+import swintransformer_modulus_polepadding_conserve_rope_vertical as swintransformer_modulus_polepadding_conserve_rope_vertical
 
 #from swintransformer_modulus_polepadding_conserve import SwinTransformerV2CrModulus_polepadding_conserve
 #import swintransformer_modulus_polepadding_conserve as swintransformer_modulus_polepadding_conserve
@@ -130,6 +130,12 @@ def main(cfg: DictConfig) -> float:
         pressure_index = 130,
         sdiff_std_file = cfg.climcorr_path+'preprocessing/normalization/outputs/SDIFF_std_zonalmean_v3_futuretend_40year_sub23.npy',
         qdiff_std_file = cfg.climcorr_path+'preprocessing/normalization/outputs/QDIFF_std_zonalmean_v3_futuretend_40year_sub23.npy',
+        # New for vertical embedding
+        vertical_embed=True,
+        nlev=26,
+        n3d_vars=7,
+        vert_dim=14,
+        surf_dim=18,
     ).to(dist.device)
 
     # create optimizer
