@@ -19,9 +19,9 @@ def save_npy(path, arr):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input_h5", required=True, help="35-year sub23 aggregated input h5")
-    ap.add_argument("--target_dc_h5", required=True, help="35-year sub23 aggregated target_dc h5")
-    ap.add_argument("--target_sum_h5", required=True, help="35-year sub23 aggregated target_sum h5")
+    ap.add_argument("--input_h5", required=True, help="5-year sub23 aggregated input h5")
+    ap.add_argument("--target_dc_h5", required=True, help="5-year sub23 aggregated target_dc h5")
+    ap.add_argument("--target_sum_h5", required=True, help="5-year sub23 aggregated target_sum h5")
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--dataset", default="data", help="dataset key inside h5 (default: data)")
     args = ap.parse_args()
@@ -36,13 +36,17 @@ def main():
     dc_mean, dc_std = compute_mean_std(args.target_dc_h5, args.dataset)
     sm_mean, sm_std = compute_mean_std(args.target_sum_h5, args.dataset)
 
-    save_npy(os.path.join(inputs_dir,  "input_mean_v2_iter2_35year_sub23.npy"), in_mean)
-    save_npy(os.path.join(inputs_dir,  "input_std_v2_iter2_35year_sub23.npy"),  in_std)
+    # NOTE: output filenames are hardcoded for the SPCAM workflow (spcam_... prefix)
+    # so they match what preprocess_climcorr_{train,val}_data_spcam_v2.py load.
+    # If you re-run this for the CAM or 35year data, change these names back
+    # (drop the "spcam_" prefix) or you will overwrite / mislabel those stats.
+    save_npy(os.path.join(inputs_dir,  "input_mean_spcam_v2_iter2_5year_sub23.npy"), in_mean)
+    save_npy(os.path.join(inputs_dir,  "input_std_spcam_v2_iter2_5year_sub23.npy"),  in_std)
 
-    save_npy(os.path.join(outputs_dir, "target_dc_mean_v2_iter2_35year_sub23.npy"), dc_mean)
-    save_npy(os.path.join(outputs_dir, "target_dc_std_v2_iter2_35year_sub23.npy"),  dc_std)
-    save_npy(os.path.join(outputs_dir, "target_sum_mean_v2_iter2_35year_sub23.npy"), sm_mean)
-    save_npy(os.path.join(outputs_dir, "target_sum_std_v2_iter2_35year_sub23.npy"),  sm_std)
+    save_npy(os.path.join(outputs_dir, "target_dc_mean_spcam_v2_iter2_5year_sub23.npy"), dc_mean)
+    save_npy(os.path.join(outputs_dir, "target_dc_std_spcam_v2_iter2_5year_sub23.npy"),  dc_std)
+    save_npy(os.path.join(outputs_dir, "target_sum_mean_spcam_v2_iter2_5year_sub23.npy"), sm_mean)
+    save_npy(os.path.join(outputs_dir, "target_sum_std_spcam_v2_iter2_5year_sub23.npy"),  sm_std)
     
     print("Saved stats to:", args.out_dir)
     print("input mean/std shapes:", in_mean.shape, in_std.shape)

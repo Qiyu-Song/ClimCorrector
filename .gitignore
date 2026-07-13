@@ -7,3 +7,7 @@ models/*/outputs/
 models/*/wandb/
 utils/__pycache__/
 notebooks/.ipynb_checkpoints/
+
+# SLURM job logs
+eo-*
+out-*

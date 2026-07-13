@@ -25,7 +25,7 @@ class data_utils:
                  save_npy=False,
                  retrieve_independent = False,
                  corrector_filename_directory='/n/home04/sweidman/holylfs06/IC_CESM2/',
-                 corrector_filename='test_fixreplay'):
+                 corrector_filename='spcam_replay_fix'):
         '''
         This class is used for preparing the training data.
         input_mean: a numpy array of shape (input_feature_len,) containing the mean of the input data. Only used if normalize is True.
