@@ -600,6 +600,200 @@ class WindowMultiHeadAttentionRoPE(nn.Module):
         return out
 
 
+# --------------------------------------------------------------------------------------
+# StereoRoPE: spherical-geometry axial 2D RoPE (STRATA, arXiv:2606.31248).
+# Feeds per-window stereographic-projection coordinates to axial RoPE instead of integer
+# grid indices, so the position encoding reflects spherical geometry (cos-lat metric,
+# poles) rather than counting grid points. Reuses _rope_apply/_rope_rotate_half above.
+# --------------------------------------------------------------------------------------
+def stereographic_projection(
+    lat: torch.Tensor, lon: torch.Tensor, lat0: torch.Tensor, lon0: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Conformal stereographic projection to a tangent plane at (lat0, lon0).
+    All inputs in radians. Returns (x East, y North). Matches STRATA's formulas."""
+    dlon = lon - lon0
+    cos_c = torch.sin(lat0) * torch.sin(lat) + torch.cos(lat0) * torch.cos(lat) * torch.cos(dlon)
+    k = 2.0 / (1.0 + cos_c)
+    x = k * torch.cos(lat) * torch.sin(dlon)
+    y = k * (torch.cos(lat0) * torch.sin(lat) - torch.sin(lat0) * torch.cos(lat) * torch.cos(dlon))
+    return x, y
+
+
+def build_padded_latlon(
+    lat_real: torch.Tensor, n_lon: int, pole_padding_value: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Construct (lat_grid, lon_grid) in DEGREES for the pole-padded feature map.
+
+    lat_real: real latitudes (row 0 = -90 S pole, row -1 = +90 N pole). Mirrors the
+    data-side pole padding: padded rows get latitudes reflected across the nearest pole
+    (top prepended above -90 -> -180-lat; bottom appended below +90 -> 180-lat) so the
+    tangent-plane coords stay continuous over the poles. Returns lat_grid (H,), lon_grid (W,),
+    H = n_lat + 2*pole_padding_value.
+    """
+    p = pole_padding_value
+    top = -180.0 - torch.flip(lat_real[:p], dims=[0])
+    bottom = 180.0 - torch.flip(lat_real[-p:], dims=[0])
+    lat_grid = torch.cat([top, lat_real, bottom], dim=0)
+    lon_grid = torch.arange(n_lon, dtype=lat_real.dtype) * (360.0 / n_lon)
+    return lat_grid, lon_grid
+
+
+def _partition_indexed(vec2d: torch.Tensor, wh: int, ww: int) -> torch.Tensor:
+    """Partition an (H, W) field into windows exactly like window_partition -> (nWin, wh*ww),
+    window order wi*(W//ww)+wj matching the Bw ordering b*nWin+win."""
+    H, W = vec2d.shape
+    v = vec2d.view(H // wh, wh, W // ww, ww)
+    v = v.permute(0, 2, 1, 3).contiguous().view(-1, wh * ww)
+    return v
+
+
+class WindowMultiHeadAttentionStereoRoPE(nn.Module):
+    r"""Windowed MHA with per-window axial 2D StereoRoPE (Swin-V2 scaled-cosine attention).
+
+    Drop-in sibling of WindowMultiHeadAttentionRoPE (axial mode), but the RoPE angles come
+    from stereographic (x, y) coordinates precomputed per window (from the true lat/lon grid)
+    instead of integer grid indices. All geometry is precomputed in __init__ (not scripted)
+    into cos/sin buffers; forward is pure tensor ops, so the model remains TorchScript-safe.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        window_size: Tuple[int, int],
+        feat_size: Tuple[int, int],
+        shift_size: Tuple[int, int],
+        lat_grid: torch.Tensor,   # (H,) degrees, padded feature map
+        lon_grid: torch.Tensor,   # (W,) degrees
+        ncol_total: Optional[int] = None,  # real global grid cells (e.g. 96*144); sets normalization
+        patch_size: int = 1,
+        rope_theta: float = 10.0,
+        ell_scale: Optional[float] = None,
+        drop_attn: float = 0.0,
+        drop_proj: float = 0.0,
+    ) -> None:
+        # rope_theta=10 (not STRATA's 100): STRATA's receptive field is ~36 cells (3-5 km);
+        # our Swin window is 4x6 cells, so with cell-unit normalization theta=10 is the
+        # capacity-matched value (matches the current grid-index RoPE). (theta, ell_scale)
+        # are coupled -- worth a small sweep.
+        super().__init__()
+        assert dim % num_heads == 0, "dim must be divisible by num_heads"
+        head_dim = dim // num_heads
+        assert head_dim % 4 == 0, f"axial StereoRoPE needs head_dim % 4 == 0, got {head_dim}"
+        assert lat_grid is not None and lon_grid is not None, "rope_stereo requires lat_grid and lon_grid"
+        assert lat_grid.shape[0] == feat_size[0] and lon_grid.shape[0] == feat_size[1], (
+            "lat_grid/lon_grid must match feat_size (patch_size=1 assumed for rope_stereo)"
+        )
+
+        self.in_features = dim
+        self.num_heads = num_heads
+        self.window_size = window_size
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=True)
+        self.attn_drop = nn.Dropout(drop_attn)
+        self.proj = nn.Linear(dim, dim, bias=True)
+        self.proj_drop = nn.Dropout(drop_proj)
+        self.logit_scale = nn.Parameter(torch.log(10 * torch.ones(num_heads)))
+
+        cos, sin = self._precompute_cos_sin(
+            feat_size, window_size, shift_size, lat_grid, lon_grid,
+            head_dim, float(rope_theta), ell_scale, ncol_total, patch_size,
+        )
+        self.register_buffer("rope_cos", cos, persistent=False)  # (nWin, L, head_dim)
+        self.register_buffer("rope_sin", sin, persistent=False)
+
+    @staticmethod
+    def _precompute_cos_sin(
+        feat_size: Tuple[int, int],
+        window_size: Tuple[int, int],
+        shift_size: Tuple[int, int],
+        lat_grid: torch.Tensor,
+        lon_grid: torch.Tensor,
+        head_dim: int,
+        theta: float,
+        ell_scale: Optional[float],
+        ncol_total: Optional[int] = None,
+        patch_size: int = 1,
+    ):
+        H, W = feat_size
+        wh, ww = window_size
+        sh, sw = shift_size
+        deg2rad = math.pi / 180.0
+
+        # same cyclic shift the block applies before window_partition:
+        # cell (i,j) of the rolled field came from ((i+sh)%H, (j+sw)%W).
+        row_idx = (torch.arange(H) + sh) % H
+        col_idx = (torch.arange(W) + sw) % W
+        lat_rows = lat_grid[row_idx] * deg2rad
+        lon_cols = lon_grid[col_idx] * deg2rad
+
+        lat2d = lat_rows[:, None].expand(H, W).contiguous()
+        lon2d = lon_cols[None, :].expand(H, W).contiguous()
+        lat_w = _partition_indexed(lat2d, wh, ww)   # (nWin, L)
+        lon_w = _partition_indexed(lon2d, wh, ww)
+
+        # per-window center: mean lat, circular mean lon
+        lat0 = lat_w.mean(dim=1, keepdim=True)
+        lon0 = torch.atan2(torch.sin(lon_w).mean(dim=1, keepdim=True),
+                           torch.cos(lon_w).mean(dim=1, keepdim=True))
+        x, y = stereographic_projection(lat_w, lon_w, lat0, lon0)
+
+        # STRATA normalization: divide by mean angular grid-cell size sqrt(4*pi*patch^2/N_total)
+        # (grid-agnostic). Puts (x,y) in grid-cell units. Falls back to median lat spacing.
+        if ell_scale is None:
+            if ncol_total is not None:
+                ell_scale = math.sqrt(4.0 * math.pi * (patch_size ** 2) / float(ncol_total))
+            else:
+                dlat = torch.abs(torch.diff(lat_grid.sort().values)).median().item() * deg2rad
+                ell_scale = float(dlat) if dlat > 0 else deg2rad
+        x = x / ell_scale
+        y = y / ell_scale
+
+        # axial 2D RoPE angles: half the head dims from x, half from y
+        p = head_dim // 4
+        freq = theta ** (-torch.arange(p, dtype=torch.float32) / float(p))
+        ang_x = x[..., None] * freq
+        ang_y = y[..., None] * freq
+        cos = torch.cat([torch.cos(ang_x).repeat_interleave(2, dim=-1),
+                         torch.cos(ang_y).repeat_interleave(2, dim=-1)], dim=-1)  # (nWin,L,hd)
+        sin = torch.cat([torch.sin(ang_x).repeat_interleave(2, dim=-1),
+                         torch.sin(ang_y).repeat_interleave(2, dim=-1)], dim=-1)
+        return cos.float(), sin.float()
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        Bw, L, C = x.shape
+        qkv = self.qkv(x).view(Bw, L, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        query, key, value = qkv.unbind(0)  # (Bw, H, L, head_dim)
+
+        # expand per-window cos/sin across the batch dimension: Bw = B * nWin
+        nWin = self.rope_cos.shape[0]
+        B = Bw // nWin
+        cos = self.rope_cos.to(dtype=query.dtype).unsqueeze(0).expand(B, -1, -1, -1).reshape(Bw, L, -1).unsqueeze(1)
+        sin = self.rope_sin.to(dtype=query.dtype).unsqueeze(0).expand(B, -1, -1, -1).reshape(Bw, L, -1).unsqueeze(1)
+
+        query = _rope_apply(query, cos, sin)
+        key = _rope_apply(key, cos, sin)
+
+        attn = F.normalize(query, dim=-1) @ F.normalize(key, dim=-1).transpose(-2, -1)
+        logit_scale = torch.clamp(
+            self.logit_scale.reshape(1, self.num_heads, 1, 1), max=math.log(1.0 / 0.01)
+        ).exp()
+        attn = attn * logit_scale
+
+        if mask is not None:
+            num_win: int = mask.shape[0]
+            attn = attn.view(Bw // num_win, num_win, self.num_heads, L, L)
+            attn = attn + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, L, L)
+
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        out = (attn @ value).transpose(1, 2).reshape(Bw, L, -1)
+        out = self.proj(out)
+        out = self.proj_drop(out)
+        return out
+
+
 class SwinTransformerV2CrBlock(nn.Module):
     r"""This class implements the Swin transformer block.
 
@@ -634,6 +828,10 @@ class SwinTransformerV2CrBlock(nn.Module):
         rel_pos: bool = True,
         pos_encoding: str = "rope_mixed",
         rope_theta: float = 100.0,
+        lat_grid: Optional[torch.Tensor] = None,
+        lon_grid: Optional[torch.Tensor] = None,
+        ncol_total: Optional[int] = None,
+        stereo_patch_size: int = 1,
     ) -> None:
         super(SwinTransformerV2CrBlock, self).__init__()
         self.dim: int = dim
@@ -662,6 +860,23 @@ class SwinTransformerV2CrBlock(nn.Module):
                 drop_attn=drop_attn,
                 drop_proj=proj_drop,
                 sequential_attn=sequential_attn,
+            )
+        elif pos_encoding == "rope_stereo":
+            # Spherical-geometry axial RoPE (StereoRoPE): per-window stereographic-projection
+            # coordinates instead of integer grid indices (defined above in this file).
+            self.attn = WindowMultiHeadAttentionStereoRoPE(
+                dim=dim,
+                num_heads=num_heads,
+                window_size=self.window_size,
+                feat_size=self.feat_size,
+                shift_size=self.shift_size,
+                lat_grid=lat_grid,
+                lon_grid=lon_grid,
+                ncol_total=ncol_total,
+                patch_size=stereo_patch_size,
+                rope_theta=rope_theta,
+                drop_attn=drop_attn,
+                drop_proj=proj_drop,
             )
         else:
             rope_mode = "mixed" if ("mixed" in pos_encoding) else "axial"
@@ -923,6 +1138,10 @@ class SwinTransformerV2CrStage(nn.Module):
         rope_theta: float = 100.0,
         grad_checkpointing: bool = False,
         random_shift: bool = False,
+        lat_grid: Optional[torch.Tensor] = None,
+        lon_grid: Optional[torch.Tensor] = None,
+        ncol_total: Optional[int] = None,
+        stereo_patch_size: int = 1,
     ) -> None:
         super(SwinTransformerV2CrStage, self).__init__()
         self.downscale: bool = downscale
@@ -971,6 +1190,10 @@ class SwinTransformerV2CrStage(nn.Module):
                     rel_pos=rel_pos,
                     pos_encoding=pos_encoding,
                     rope_theta=rope_theta,
+                    lat_grid=lat_grid,
+                    lon_grid=lon_grid,
+                    ncol_total=ncol_total,
+                    stereo_patch_size=stereo_patch_size,
                 )
                 for index in range(depth)
             ]
@@ -1085,6 +1308,7 @@ class SwinTransformerV2CrModulus_polepadding_conserve(modulus.Module):
         # super(SwinTransformerV2Cr, self).__init__()
         super().__init__(meta=SwinTransformerV2CrModulusMetaData())
         img_size = to_2tuple(img_size)
+        self._ncol_total = int(img_size[0] * img_size[1])  # real global grid cells (pre-pad), for rope_stereo normalization
         self.pole_padding = pole_padding
         self.pole_padding_value = pole_padding_value
         self.pole_tqmean = pole_tqmean
@@ -1141,6 +1365,17 @@ class SwinTransformerV2CrModulus_polepadding_conserve(modulus.Module):
         self.register_buffer("sdiff_std", _load_maybe(sdiff_std_file)) # of shape (26,96)
         self.register_buffer("qdiff_std", _load_maybe(qdiff_std_file)) # of shape (26,96)
 
+        # rope_stereo geometry: lat/lon of the (pole-padded) feature map. Built once and used
+        # only to precompute the per-window stereographic RoPE; not used in forward. Only
+        # constructed when pos_encoding == 'rope_stereo', so other models are unaffected.
+        stereo_lat_grid = None
+        stereo_lon_grid = None
+        if pos_encoding == "rope_stereo":
+            if grid_info is None:
+                raise ValueError("pos_encoding='rope_stereo' requires grid_info (for latitudes)")
+            lat_real = torch.as_tensor(xr.open_dataset(grid_info)["lat"].values, dtype=torch.float32)
+            pad = self.pole_padding_value if self.pole_padding else 0
+            stereo_lat_grid, stereo_lon_grid = build_padded_latlon(lat_real, img_size[1], pad)
 
         self.patch_embed = PatchEmbed(
             img_size=img_size,
@@ -1183,6 +1418,10 @@ class SwinTransformerV2CrModulus_polepadding_conserve(modulus.Module):
                     rope_theta=rope_theta,
                     grad_checkpointing=self.checkpoint_stages,
                     random_shift=random_shift,
+                    lat_grid=stereo_lat_grid,
+                    lon_grid=stereo_lon_grid,
+                    ncol_total=self._ncol_total,
+                    stereo_patch_size=patch_size,
                 )
             ]
             self.feature_info += [
