@@ -90,7 +90,10 @@ swin:
    depths: 12
    num_heads: 8
    mlp_ratio: 4.0
+   init_values: 0.0
    drop_rate: 0.0
+   pos_encoding: 'rope_mixed'
+   rope_theta: 10.0
    checkpoint_stages: False
    pole_padding: True
    pole_padding_value: 6
