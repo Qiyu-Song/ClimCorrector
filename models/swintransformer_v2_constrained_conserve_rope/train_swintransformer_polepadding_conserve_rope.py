@@ -236,15 +236,30 @@ def main(cfg: DictConfig) -> float:
         loaded_epoch = 0
 
     
-    # create loss function
+    # create loss function (reduction='none' so we can optionally area-weight over latitude)
     if cfg.loss == 'mse':
-        criterion = nn.MSELoss()
+        criterion = nn.MSELoss(reduction='none')
     elif cfg.loss == 'mae':
-        criterion = nn.L1Loss()
+        criterion = nn.L1Loss(reduction='none')
     elif cfg.loss == 'huber':
-        criterion = nn.SmoothL1Loss()
+        criterion = nn.SmoothL1Loss(reduction='none')
     else:
         raise ValueError('Loss function not implemented')
+
+    # optional latitude/area weighting (grid_info gw = FV cell-area weights over the 96 lats).
+    # w_lat has mean 1, so the loss scale matches the unweighted case; loss_area_weight=False
+    # reproduces the previous behavior exactly.
+    if cfg.loss_area_weight:
+        gw = xr.open_dataset(cfg.climcorr_path + 'utils/grid_info.nc').gw.values  # (96,)
+        w_lat = torch.tensor(gw / gw.mean(), dtype=torch.float32, device=device).view(1, 1, 96, 1)
+    else:
+        w_lat = None
+
+    def compute_loss(output, target):
+        per_elem = criterion(output, target)
+        if w_lat is not None:
+            per_elem = per_elem * w_lat
+        return per_elem.mean()
     
     
     # Initialize the console logger
@@ -318,7 +333,7 @@ def main(cfg: DictConfig) -> float:
                 target = target.permute(0, 3, 1, 2)
                 optimizer.zero_grad()
                 output = model(data_input)
-                loss = criterion(output, target)
+                loss = compute_loss(output, target)
                 loss.backward()
 
                 # # for debug only, check if any parameter has None grad/not used in the backward pass
@@ -351,7 +366,7 @@ def main(cfg: DictConfig) -> float:
                 data_input = data_input.permute(0, 3, 1, 2)
                 target = target.permute(0, 3, 1, 2)
                 output = model(data_input)
-                loss = criterion(output, target)
+                loss = compute_loss(output, target)
                 val_loss += loss.item() * data_input.size(0)
                 num_samples_processed += data_input.size(0)
 

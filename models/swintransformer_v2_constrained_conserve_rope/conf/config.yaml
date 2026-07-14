@@ -22,6 +22,7 @@ num_workers: 16
 # training parameters
 expname: 'lstm_v1_test'
 loss: 'huber'
+loss_area_weight: False  # if True, weight the loss by grid_info gw (FV cell area) over latitude
 optimizer: 'adam'
 batch_size: 1024
 epochs: 1
