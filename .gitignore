@@ -11,3 +11,6 @@ notebooks/.ipynb_checkpoints/
 # SLURM job logs
 eo-*
 out-*
+
+# editor/agent scratch backups
+*.bak-*

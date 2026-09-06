@@ -17,12 +17,23 @@ variable_subsets: 'v1'
 input_clip: False
 target_clip: True
 target_clip_value: 100
+train_subsample_frac: 1.0  # fraction of train samples to use (random, seeded). 1.0 = all (previous behavior). <1.0 for data-amount / learning-curve experiments.
+
+# --- training speed (defaults preserve previous behaviour exactly) ---
+amp_bf16: False        # bf16 autocast around fwd+loss. Measured no change in loss trajectory.
+compile_blocks: False  # torch.compile each horiz/vert block INSIDE the checkpoint boundary.
+                       # amp_bf16+compile_blocks together = 2.90x per sample on the factorized model.
 num_workers: 16
 
 # training parameters
 expname: 'lstm_v1_test'
 loss: 'huber'
 loss_area_weight: False  # if True, weight the loss by grid_info gw (FV cell area) over latitude
+loss_spectral: False       # if True, add a spatial-gradient ("spectral") loss term to combat blurring / under-dispersion of extremes. False = exact previous behavior.
+loss_spectral_weight: 0.1  # weight on the spectral term (only used if loss_spectral=True); keeps it a nudge, not a dominator
+log_val_r2: False          # if True, compute + log zonal / per-level validation R2 to wandb each epoch (scalars) + image plots every r2_plot_freq epochs. False = previous behavior.
+r2_plot_freq: 5            # when log_val_r2=True: log the full zonal/per-level R2 image plots every N epochs (per-variable R2 scalars are logged every epoch)
+seed: 42                 # RNG seed; vary for seed-repeat / noise-floor runs
 optimizer: 'adam'
 batch_size: 1024
 epochs: 1
